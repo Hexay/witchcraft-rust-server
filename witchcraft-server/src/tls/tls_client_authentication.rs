@@ -117,8 +117,9 @@ impl<T> TlsClientAuthenticationEndpoint<T> {
         if valid {
             Ok(())
         } else {
-            Err(Error::internal_safe(
+            Err(Error::service_safe(
                 "Client certificate is not valid for any trusted subject name",
+                PermissionDenied::new(),
             ))
         }
     }

@@ -85,7 +85,7 @@ impl<T> JobQueue<T> {
             node.reset(&mut state.waiters);
 
             if result.timed_out() {
-                return None;
+                return state.jobs.pop_front();
             }
         }
     }

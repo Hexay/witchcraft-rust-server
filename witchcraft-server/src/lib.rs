@@ -257,6 +257,7 @@
 //! ## Logging
 //!
 //! * `logging.queue (type: <log_type>)` (gauge) - The number of log messages queued for output.
+//! * `logging.errors (type: <log_type>)` (meter) - The rate of errors encountered writing log messages to their output.
 //!
 //! ## Process
 //!

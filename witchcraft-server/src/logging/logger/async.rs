@@ -21,11 +21,13 @@ use pin_project::pin_project;
 use std::collections::VecDeque;
 use std::error;
 use std::future::Future;
+use std::io::{self, Write};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
+use std::time::{Duration, Instant};
 use tokio::task::{self, JoinHandle};
-use witchcraft_metrics::{MetricId, MetricRegistry};
+use witchcraft_metrics::{Meter, MetricId, MetricRegistry};
 
 #[derive(Debug)]
 pub struct Closed;
@@ -39,6 +41,7 @@ impl fmt::Display for Closed {
 impl error::Error for Closed {}
 
 const QUEUE_LIMIT: usize = 10_000;
+const ERROR_REPORT_INTERVAL: Duration = Duration::from_secs(60);
 
 struct State<T> {
     queue: VecDeque<T>,
@@ -93,6 +96,7 @@ impl<T> AsyncAppender<T> {
     pub fn new<S>(inner: S, metrics: &MetricRegistry, hooks: &mut ShutdownHooks) -> Self
     where
         S: Sink<T> + 'static + Send,
+        S::Error: fmt::Display,
         T: LogFormat + 'static + Send,
     {
         let state = Arc::new(Mutex::new(State {
@@ -110,7 +114,15 @@ impl<T> AsyncAppender<T> {
 
         let handle = task::spawn({
             let state = state.clone();
-            WorkerFuture { state, inner }
+            WorkerFuture {
+                state,
+                inner,
+                errors: ErrorReporter {
+                    log_type: T::TYPE,
+                    meter: metrics.meter(MetricId::new("logging.errors").with_tag("type", T::TYPE)),
+                    last_report: None,
+                },
+            }
         });
 
         hooks.push(ShutdownFuture {
@@ -218,11 +230,13 @@ struct WorkerFuture<T, S> {
     #[pin]
     inner: S,
     state: Arc<Mutex<State<T>>>,
+    errors: ErrorReporter,
 }
 
 impl<T, S> Future for WorkerFuture<T, S>
 where
     S: Sink<T>,
+    S::Error: fmt::Display,
 {
     type Output = ();
 
@@ -234,7 +248,7 @@ where
 
         while !state.queue.is_empty() {
             drop(state);
-            let _ = ready!(this.inner.as_mut().poll_ready(cx));
+            let ready = ready!(this.inner.as_mut().poll_ready(cx));
             state = this.state.lock();
 
             // Even though we've released the lock since seeing that the queue was not empty, we know that fact hasn't
@@ -245,7 +259,9 @@ where
             }
 
             drop(state);
-            let _ = this.inner.as_mut().start_send(value);
+            if let Err(e) = ready.and_then(|()| this.inner.as_mut().start_send(value)) {
+                this.errors.report(&e);
+            }
             state = this.state.lock();
         }
 
@@ -261,7 +277,9 @@ where
 
         if !state.flushed {
             drop(state);
-            let _ = ready!(this.inner.as_mut().poll_flush(cx));
+            if let Err(e) = ready!(this.inner.as_mut().poll_flush(cx)) {
+                this.errors.report(&e);
+            }
             state = this.state.lock();
 
             // Since we've released the lock after seeing that the queue was empty above, we don't want to claim to a
@@ -280,8 +298,121 @@ where
         }
 
         drop(state);
-        let _ = ready!(this.inner.as_mut().poll_close(cx));
+        if let Err(e) = ready!(this.inner.as_mut().poll_close(cx)) {
+            this.errors.report(&e);
+        }
 
         Poll::Ready(())
+    }
+}
+
+struct ErrorReporter {
+    log_type: &'static str,
+    meter: Arc<Meter>,
+    last_report: Option<Instant>,
+}
+
+impl ErrorReporter {
+    // Errors go to stderr rather than witchcraft_log, which could feed back into the failing appender.
+    fn report(&mut self, error: &dyn fmt::Display) {
+        self.meter.mark(1);
+
+        let now = Instant::now();
+        if self
+            .last_report
+            .is_none_or(|last| now.duration_since(last) >= ERROR_REPORT_INTERVAL)
+        {
+            self.last_report = Some(now);
+            let _ = writeln!(io::stderr(), "error writing {} log: {error}", self.log_type);
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::logging::format::ReportLog;
+    use futures_util::SinkExt;
+    use tokio::time;
+
+    struct TestLog(u32);
+
+    impl LogFormat for TestLog {
+        const TYPE: &'static str = "test.1";
+        const FILE_STEM: &'static str = "test";
+        const SIZE_LIMIT_GB: u32 = 1;
+        const TIME_LIMIT_DAYS: u32 = 1;
+
+        type Reporter = NoopReporter;
+    }
+
+    struct NoopReporter;
+
+    impl ReportLog<TestLog> for NoopReporter {
+        fn new(_: &MetricRegistry) -> Self {
+            NoopReporter
+        }
+
+        fn report(&self, _: &TestLog) {}
+    }
+
+    // Like RollingFileAppender, panics if start_send is called after poll_ready fails.
+    struct FailingSink {
+        ready_failures: VecDeque<bool>,
+        failed: bool,
+        sent: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl Sink<TestLog> for FailingSink {
+        type Error = io::Error;
+
+        fn poll_ready(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.failed = self.ready_failures.pop_front().unwrap_or(false);
+            if self.failed {
+                Poll::Ready(Err(io::Error::other("injected")))
+            } else {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: TestLog) -> io::Result<()> {
+            assert!(!self.failed, "start_send called without poll_ready");
+            self.sent.lock().push(item.0);
+            Ok(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_ready_error() {
+        let sent = Arc::new(Mutex::new(vec![]));
+        let sink = FailingSink {
+            ready_failures: VecDeque::from([false, true]),
+            failed: false,
+            sent: sent.clone(),
+        };
+        let metrics = MetricRegistry::new();
+        let mut hooks = ShutdownHooks::new();
+        let mut appender = AsyncAppender::new(sink, &metrics, &mut hooks);
+
+        time::timeout(Duration::from_secs(5), async {
+            for i in 0..3 {
+                appender.send(TestLog(i)).await.unwrap();
+            }
+            hooks.await;
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(*sent.lock(), [0, 2]);
+        let meter = metrics.meter(MetricId::new("logging.errors").with_tag("type", TestLog::TYPE));
+        assert_eq!(meter.count(), 1);
     }
 }

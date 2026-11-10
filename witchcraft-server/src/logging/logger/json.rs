@@ -49,8 +49,10 @@ where
 
     fn start_send(self: Pin<&mut Self>, value: T) -> io::Result<()> {
         let this = self.project();
-        json::to_writer(this.buf.writer(), &value)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+        if let Err(e) = json::to_writer(this.buf.writer(), &value) {
+            this.buf.clear();
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, e));
+        }
         this.buf.put_u8(b'\n');
 
         this.inner.start_send(this.buf.split().freeze())
@@ -62,5 +64,37 @@ where
 
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.project().inner.poll_close(cx)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use futures_util::SinkExt;
+    use serde::ser::{Error as _, SerializeMap};
+    use std::convert::Infallible;
+
+    struct FailsHalfway;
+
+    impl Serialize for FailsHalfway {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            let mut map = serializer.serialize_map(None)?;
+            map.serialize_entry("partial", &1)?;
+            Err(S::Error::custom("boom"))
+        }
+    }
+
+    #[tokio::test]
+    async fn serialization_error_does_not_corrupt_next_record() {
+        let inner = Vec::<Bytes>::new().sink_map_err(|e: Infallible| -> io::Error { match e {} });
+        let mut appender = JsonAppender::new(inner);
+
+        appender.send(FailsHalfway).await.unwrap_err();
+        appender.send("ok").await.unwrap();
+
+        assert_eq!(appender.inner.get_ref(), &[Bytes::from("\"ok\"\n")]);
     }
 }

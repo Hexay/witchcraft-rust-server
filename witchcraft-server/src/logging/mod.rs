@@ -66,6 +66,8 @@ pub(crate) async fn init(
     runtime: &Refreshable<LoggingConfig, Error>,
     hooks: &mut ShutdownHooks,
 ) -> Result<Loggers, Error> {
+    cleanup::cleanup_logs().await;
+
     metric::init(metrics, install, hooks).await?;
     service::init(metrics, install, runtime, hooks).await?;
     trace::init(metrics, install, runtime, hooks).await?;
@@ -89,8 +91,6 @@ pub(crate) async fn init(
         .set(event_logger)
         .ok()
         .expect("Event logger already initialized");
-
-    cleanup::cleanup_logs().await;
 
     Ok(Loggers {
         request_logger,

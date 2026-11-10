@@ -141,6 +141,7 @@ async fn runtime_reload<T>(
 ) where
     T: DeserializeOwned + PartialEq + 'static + Sync + Send,
 {
+    let mut read_failed = false;
     loop {
         time::sleep(RELOAD_INTERVAL).await;
 
@@ -154,13 +155,15 @@ async fn runtime_reload<T>(
                         error: Error::internal_safe(e)
                     );
                     config_ok.store(false, Ordering::Relaxed);
+                    read_failed = true;
                     return;
                 }
             };
 
-            if files.up_to_date(&new_bytes) {
+            if !read_failed && files.up_to_date(&new_bytes) {
                 return;
             }
+            read_failed = false;
 
             let (value, new_files) = parse(&new_bytes, key.as_ref());
             files = new_files;

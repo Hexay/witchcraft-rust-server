@@ -120,7 +120,10 @@ fn can_gzip<B>(request: &Request<B>) -> bool {
         }
 
         if let Some(weight) = it.next() {
-            if matches!(weight.trim(), "q=0" | "q=0." | "q=0.0" | "q=0.00" | "q=000") {
+            if matches!(
+                weight.trim(),
+                "q=0" | "q=0." | "q=0.0" | "q=0.00" | "q=0.000"
+            ) {
                 return false;
             }
         }
@@ -336,6 +339,15 @@ mod test {
         let body = response.into_body();
         let buf = body.collect().await.unwrap().to_bytes();
         assert_eq!(&*buf, [0; MIN_SIZE as usize + 1]);
+    }
+
+    #[test]
+    fn respect_three_digit_zero_quality() {
+        let request = Request::builder()
+            .header(ACCEPT_ENCODING, "gzip;q=0.000")
+            .body(())
+            .unwrap();
+        assert!(!can_gzip(&request));
     }
 
     #[tokio::test]
